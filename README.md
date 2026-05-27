@@ -1,47 +1,94 @@
-# MedGemma Chromosome VLM — Training Guide
+<div align="center">
 
-Fine-tune **Google MedGemma-4B-IT** (vision–language) on chromosome karyotype images to produce **structured, image-grounded cytogenetics reports**. This repository contains the optimized Unsloth + LoRA training pipeline, evaluation scripts, and inference entrypoints used for the `Mukilan06/MedGemma-Chromosome-VLM` Hugging Face adapter.
+# MedGemma Chromosome VLM
 
-Run all commands from the **repository root** (where `chromastone_vlm/` and `scripts/` live).
+**Fine-tune MedGemma on karyotype images → structured, image-grounded cytogenetics reports**
 
----
+[![Model](https://img.shields.io/badge/Base-google%2Fmedgemma--4b--it-4285F4?style=for-the-badge&logo=google&logoColor=white)](https://huggingface.co/google/medgemma-4b-it)
+[![Adapter](https://img.shields.io/badge/Adapter-Mukilan06%2FMedGemma--Chromosome--VLM-FFD21E?style=for-the-badge&logo=huggingface&logoColor=black)](https://huggingface.co/Mukilan06/MedGemma-Chromosome-VLM)
+[![Training](https://img.shields.io/badge/Training-Unsloth%20%2B%20LoRA-00C853?style=for-the-badge)]()
+[![GPU](https://img.shields.io/badge/GPU-4--bit%20%7C%20BF16%20%7C%20FlashAttn2-76FF03?style=for-the-badge&logo=nvidia)]()
+[![Python](https://img.shields.io/badge/Python-3.10+-3776AB?style=for-the-badge&logo=python&logoColor=white)]()
 
-## Table of contents
+[Quick Start](#-quick-start) ·
+[Training](#-training) ·
+[Checkpoints](#-recommended-checkpoint) ·
+[Inference](#-inference) ·
+[Hyperparameters](#-hyperparameters) ·
+[Troubleshooting](#-troubleshooting)
 
-1. [What this training does](#what-this-training-does)
-2. [Hardware and environment](#hardware-and-environment)
-3. [Dataset layout](#dataset-layout)
-4. [Preprocessing pipeline](#preprocessing-pipeline)
-5. [Model and adaptation strategy](#model-and-adaptation-strategy)
-6. [Training hyperparameters](#training-hyperparameters)
-7. [How a training step works](#how-a-training-step-works)
-8. [Running training](#running-training)
-9. [Checkpointing and early stopping](#checkpointing-and-early-stopping)
-10. [Evaluation during and after training](#evaluation-during-and-after-training)
-11. [Recommended checkpoint](#recommended-checkpoint)
-12. [Inference and Hugging Face reuse](#inference-and-hugging-face-reuse)
-13. [CLI reference](#cli-reference)
-14. [Outputs and logs](#outputs-and-logs)
-15. [Troubleshooting](#troubleshooting)
-16. [Project layout](#project-layout)
+</div>
 
 ---
 
-## What this training does
+> **Run all commands from the repository root** — the folder that contains `chromastone_vlm/` and `scripts/`.
 
-The model learns to map a **single chromosome spread image** to a fixed **seven-field medical report**:
+<br>
 
-| Field | Role |
-|-------|------|
-| `ChromosomeCount` | Visible structure count (parsed from VQA / captions) |
-| `Morphology` | Dominant morphology description (acrocentric, submetacentric, etc.) |
-| `Overlap` | Whether overlap is present in the image |
-| `ImageQuality` | Diagnostic usability of the image |
+## At a glance
+
+<table>
+<tr>
+<td width="25%" align="center">
+<h3>4,800</h3>
+<p>labeled spreads<br><sub>train · val · test</sub></p>
+</td>
+<td width="25%" align="center">
+<h3>448×448</h3>
+<p>CLAHE + letterbox<br><sub>cached PNGs</sub></p>
+</td>
+<td width="25%" align="center">
+<h3>~250 MB</h3>
+<p>LoRA adapter only<br><sub>not full 4B weights</sub></p>
+</td>
+<td width="25%" align="center">
+<h3>checkpoint-250</h3>
+<p>best val loss ≈ <b>0.430</b><br><sub>use for deployment</sub></p>
+</td>
+</tr>
+</table>
+
+| | |
+|:---|:---|
+| **Task** | Image → 7-field structured cytogenetics report |
+| **Base model** | `unsloth/medgemma-4b-it-unsloth-bnb-4bit` |
+| **Adaptation** | LoRA r=32 on language layers (vision frozen) |
+| **Effective batch** | 16 (1 × 16 grad accum) |
+| **Typical runtime** | ~2.6 h on L4 for 6 epochs / 1350 steps |
+
+<br>
+
+## What you get
+
+The model maps one **chromosome spread image** to a fixed report with seven labels:
+
+```
+ChromosomeCount: 46
+Morphology: Predominantly acrocentric groups with preserved overall structure.
+Overlap: present
+ImageQuality: Diagnostic quality is sufficient for morphology-level description.
+Findings: Image-grounded structural observations from the spread.
+Impression: Conservative interpretation only; no unsupported abnormality claimed.
+Uncertainty: Fine cytogenetic resolution may be limited where overlap is present.
+```
+
+<details>
+<summary><b>Field reference</b></summary>
+
+| Field | Purpose |
+|:------|:--------|
+| `ChromosomeCount` | Visible structure count (from VQA / captions) |
+| `Morphology` | Dominant morphology (acrocentric, submetacentric, …) |
+| `Overlap` | Whether overlap is present |
+| `ImageQuality` | Diagnostic usability |
 | `Findings` | Image-grounded observations |
-| `Impression` | Conservative interpretation (no unsupported syndromes) |
-| `Uncertainty` | Explicit limits of resolution / ambiguity |
+| `Impression` | Conservative interpretation — no invented syndromes |
+| `Uncertainty` | Explicit limits of resolution |
 
-**System prompt** (fixed for train and inference):
+</details>
+
+<details>
+<summary><b>System prompt</b> (train + inference)</summary>
 
 ```text
 You are a cytogenetics vision-language assistant. Report only image-grounded findings.
@@ -50,20 +97,15 @@ directly supported by the visible morphology. When a detail is uncertain or unre
 say so explicitly.
 ```
 
-Training uses **completion-only loss**: only the assistant’s structured report tokens contribute to the loss; the user prompt and image tokens are masked.
+</details>
 
----
+Training uses **completion-only loss** — only assistant report tokens are optimized; prompts and image tokens are masked.
 
-## Hardware and environment
+<br>
 
-| Item | Recommendation |
-|------|----------------|
-| GPU | NVIDIA L4 / A10 / similar with **≥22 GB VRAM** |
-| Precision | **BF16** compute on 4-bit weights |
-| RAM | Enough for 6 dataloader workers + image cache |
-| Disk | Space for `dataset/cache/` PNGs and checkpoints (~300 MB+ per checkpoint) |
+## Quick start
 
-### Setup
+### 1 · Environment
 
 ```bash
 python3 -m venv .venv-medgemma
@@ -71,205 +113,255 @@ source .venv-medgemma/bin/activate
 pip install -r requirements.txt
 ```
 
-MedGemma is **gated** on Hugging Face. Accept the model license, then authenticate:
+MedGemma is gated on Hugging Face — accept the license, then:
 
 ```bash
 python -c "from huggingface_hub import login; login(token='YOUR_HF_TOKEN')"
 ```
 
-**Key dependencies:** PyTorch, `transformers`, `trl`, `peft`, `bitsandbytes`, `accelerate`, `unsloth`, OpenCV (CLAHE), Pillow.
+### 2 · Train
 
-Default config lives in `chromastone_vlm/optimized_config.py` (`OptimizedMedGemmaConfig`).
+```bash
+python scripts/train_medgemma_optimized.py \
+  --epochs 6 \
+  --eval-steps 50 \
+  --save-steps 50 \
+  --generation-eval-steps 1000000 \
+  --skip-final-generation-eval
+```
 
----
+### 3 · Evaluate & infer
 
-## Dataset layout
+```bash
+# Evaluate
+python scripts/evaluate_medgemma_optimized.py \
+  --checkpoint-dir dataset/checkpoints/medgemma_optimized/checkpoint-250 \
+  --split test --sample-limit 10
 
-Place data under `dataset/` (symlinked from `Chromosome-dataset/dataset` if you kept the old folder):
+# Infer (local)
+python scripts/infer_medgemma_optimized.py \
+  --checkpoint-dir dataset/checkpoints/medgemma_optimized/checkpoint-250 \
+  --image dataset/cache/medgemma_l4/test/images_448/1054443.png
+
+# Infer (Hugging Face adapter)
+python scripts/infer_medgemma_hf_adapter.py \
+  --adapter-repo Mukilan06/MedGemma-Chromosome-VLM \
+  --image dataset/cache/medgemma_l4/test/images_448/1054443.png
+```
+
+<br>
+
+## Training pipeline
+
+```mermaid
+flowchart TB
+  subgraph Data
+    A[(JSONL annotations)] --> B[CLAHE · autocontrast]
+    B --> C[448×448 letterbox cache]
+  end
+  subgraph Model
+    C --> D[MedGemma 4-bit + LoRA]
+    D --> E[Completion-only SFT]
+  end
+  subgraph Monitor
+    E --> F{eval_steps}
+    F -->|fast| G[eval_loss]
+    F -->|optional| H[BLEU · ROUGE · medical score]
+    G --> I[checkpoint-*]
+  end
+```
+
+<details>
+<summary><b>Step-by-step</b></summary>
+
+1. **Collator** — multimodal chat (image + text), `max_length=2048`
+2. **Loss** — cross-entropy on assistant tokens only
+3. **Gemma3** — `model_accepts_loss_kwargs=False` (avoids `num_items_in_batch` bugs)
+4. **Every `eval_steps`** — fast `eval_loss` on 192 val samples
+5. **Every `generation_eval_steps`** — optional decode metrics (slow; disable in production)
+6. **End** — saves `final/` adapter + reloads best checkpoint
+
+</details>
+
+<br>
+
+## Dataset
 
 ```text
 dataset/
 ├── processed_data/
-│   ├── train/
-│   │   ├── final_annotations.jsonl
-│   │   └── images/
-│   ├── val/
-│   │   ├── annotations.jsonl
-│   │   └── images/
-│   └── test/
-│       ├── annotations.jsonl
-│       └── images/
-├── cache/medgemma_l4/          # auto-built resized PNGs
-│   ├── train/images_448/
-│   ├── val/images_448/
-│   └── test/images_448/
+│   ├── train/   → final_annotations.jsonl + images/
+│   ├── val/     → annotations.jsonl + images/
+│   └── test/    → annotations.jsonl + images/
+├── cache/medgemma_l4/              # built automatically
+│   └── {split}/images_448/*.png
 ├── checkpoints/medgemma_optimized/
 └── reports/medgemma_optimized/
 ```
 
-### Splits (from a completed run)
-
-| Split | Samples | Notes |
-|-------|---------|--------|
+| Split | Samples | Annotation file |
+|:-----:|:-------:|:----------------|
 | Train | 4,200 | `final_annotations.jsonl` |
 | Val | 300 | `annotations.jsonl` |
 | Test | 300 | `annotations.jsonl` |
 
-Train distribution is **heavily skewed** toward normal count (46) and acrocentric morphology; the pipeline uses **weighted sampling** so rare buckets are seen more often (see [Balanced sampling](#balanced-sampling)).
+> Train data is skewed toward count **46** and **acrocentric** morphology. **Weighted sampling** upsamples rare buckets — see [Balanced sampling](#balanced-sampling).
 
-Each JSONL record should include at least an `image` path and rich `annotation` / `vqa` fields. The code derives targets from:
+Targets are built from VQA (*"How many chromosome structures are visible"*) plus `annotation.*` fields (`morphology_description`, `biomedical_findings`, `cytogenetic_interpretation`, overlap signals, etc.).
 
-- VQA answer: *"How many chromosome structures are visible"*
-- `annotation.morphology_description`, `detailed_caption`, `biomedical_findings`, `cytogenetic_interpretation`, `quality_assessment`, overlap signals, etc.
+<br>
 
----
+## Preprocessing
 
-## Preprocessing pipeline
+| Step | Detail |
+|:-----|:-------|
+| 1 | RGB load + EXIF transpose |
+| 2 | **CLAHE** on L channel (clip 1.5, grid 8×8) |
+| 3 | Autocontrast (cutoff 0.5) |
+| 4 | Thumbnail inside **448×448** (bicubic) |
+| 5 | White letterbox pad → exact 448×448 |
 
-Before training, `prepare_split_records()` builds a **cached PNG** per image:
+Cache: `dataset/cache/medgemma_l4/{split}/images_448/`  
+Rebuild: `--force-refresh-cache`
 
-1. Load RGB, apply EXIF transpose  
-2. **CLAHE** on L channel (clip limit 1.5, 8×8 tiles) — improves contrast on metaphase spreads  
-3. Autocontrast (cutoff 0.5)  
-4. Thumbnail to fit inside **448×448** (bicubic)  
-5. **Letterbox** on white padding (`image_pad_value=255`) to exactly 448×448  
+<br>
 
-Cached paths: `dataset/cache/medgemma_l4/{split}/images_448/{name}.png`  
-Manifests: `dataset/cache/medgemma_l4/{split}/manifest.jsonl`
+## Model stack
 
-Force rebuild: `--force-refresh-cache`
+<table>
+<tr>
+<td>
 
----
+**Weights**
 
-## Model and adaptation strategy
+`unsloth/medgemma-4b-it-unsloth-bnb-4bit`  
+Fallback: `google/medgemma-4b-it`
 
-| Component | Setting |
-|-----------|---------|
-| Primary weights | `unsloth/medgemma-4b-it-unsloth-bnb-4bit` |
-| Fallback (no Unsloth) | `google/medgemma-4b-it` |
-| Quantization | **4-bit NF4**, double quant, BF16 compute |
-| Attention | **Flash Attention 2** when available |
-| Trainer | TRL `SFTTrainer` + custom weighted sampler |
-| Backend | **Unsloth** `FastVisionModel` (preferred) |
+</td>
+<td>
 
-### LoRA (language-only)
+**Quantization**
 
-| Parameter | Value |
-|-----------|-------|
-| Rank `r` | 32 |
-| Alpha | 64 |
-| Dropout | 0.0 |
+4-bit NF4 · double quant · BF16 compute
+
+</td>
+<td>
+
+**Attention**
+
+Flash Attention 2 (auto-fallback)
+
+</td>
+</tr>
+<tr>
+<td>
+
+**Trainer**
+
+TRL `SFTTrainer` + weighted sampler
+
+</td>
+<td>
+
+**Backend**
+
+Unsloth `FastVisionModel`
+
+</td>
+<td>
+
+**Saved artifact**
+
+LoRA adapter ~250 MB
+
+</td>
+</tr>
+</table>
+
+### LoRA configuration
+
+| | Value |
+|:---|:---|
+| Rank `r` / Alpha | **32** / **64** |
 | RSLoRA | enabled |
-| Vision layers | **not** fine-tuned (`finetune_vision_layers=False`) |
-| Language attention + MLP | fine-tuned |
-| Target modules | `q_proj`, `k_proj`, `v_proj`, `o_proj`, `gate_proj`, `up_proj`, `down_proj` |
-
-Only the **LoRA adapter** is saved per checkpoint (~250 MB), not the full 4B model.
-
-### Effective batch size
+| Vision | frozen |
+| Language attn + MLP | trained |
+| Targets | `q_proj` `k_proj` `v_proj` `o_proj` `gate_proj` `up_proj` `down_proj` |
 
 ```text
-effective_batch = per_device_train_batch_size × gradient_accumulation_steps × num_gpus
-                = 1 × 16 × 1 = 16
+effective_batch = train_batch × grad_accum × GPUs = 1 × 16 × 1 = 16
 ```
 
-On an L4, one training run of 6 epochs reached **global step 1350** in ~2.6 hours (`train_runtime` ≈ 9352 s, ~2.7 samples/s).
+<br>
 
----
+## Hyperparameters
 
-## Training hyperparameters
+<details open>
+<summary><b>Optimization</b></summary>
 
-Defaults from `OptimizedMedGemmaConfig` (overridable via CLI):
-
-### Optimization
-
-| Parameter | Default | Description |
-|-----------|---------|-------------|
-| `num_train_epochs` | 6 | Full passes over train set |
-| `learning_rate` | `8e-5` | Peak LR |
-| `lr_scheduler_type` | `cosine` | With `warmup_ratio=0.05` |
+| Parameter | Default | Notes |
+|:----------|:-------:|:------|
+| `num_train_epochs` | 6 | |
+| `learning_rate` | `8e-5` | cosine + 5% warmup |
 | `weight_decay` | 0.01 | |
-| `max_grad_norm` | 0.5 | Gradient clipping |
-| `optim` | `paged_adamw_8bit` | Memory-efficient AdamW |
-| `seed` | 3407 | Reproducibility |
+| `max_grad_norm` | 0.5 | |
+| `optim` | `paged_adamw_8bit` | |
+| `seed` | 3407 | |
 
-### Batching and sequence length
+</details>
+
+<details>
+<summary><b>Batching & I/O</b></summary>
 
 | Parameter | Default |
-|-----------|---------|
+|:----------|:-------:|
 | `per_device_train_batch_size` | 1 |
-| `per_device_eval_batch_size` | 1 |
 | `gradient_accumulation_steps` | 16 |
 | `max_length` | 2048 |
 | `dataloader_num_workers` | 6 |
 | `dataloader_prefetch_factor` | 4 |
-| `dataloader_pin_memory` | true |
-| `dataloader_persistent_workers` | true |
 
-### Checkpointing and validation
+</details>
 
-| Parameter | Default | Notes |
-|-----------|---------|-------|
-| `evaluation_strategy` | `steps` | |
-| `eval_steps` | 200 | Fast **eval_loss** on 192 val samples |
-| `save_steps` | 200 | Keep last 3 checkpoints |
-| `save_total_limit` | 3 | Older checkpoints pruned |
-| `metric_for_best_model` | `eval_loss` | Lower is better |
-| `early_stopping_patience` | 4 | Stops if eval_loss stalls |
-| `generation_eval_steps` | 400 | Slow **generation** metrics on 96 val samples |
-
-### Generation (eval / inference)
+<details>
+<summary><b>Checkpointing & validation</b></summary>
 
 | Parameter | Default | Notes |
-|-----------|---------|-------|
-| `generation_max_new_tokens` | 96 | Config default; inference bumps to **≥160** with retry |
-| `generation_num_beams` | 1 | Greedy decoding |
-| `generation_temperature` | 0.0 | Deterministic |
+|:----------|:-------:|:------|
+| `eval_steps` | 200 | Fast loss on 192 val samples |
+| `save_steps` | 200 | Keep last 3 |
+| `metric_for_best_model` | `eval_loss` | lower is better |
+| `early_stopping_patience` | 4 | |
+| `generation_eval_steps` | 400 | Set `1000000` to disable |
 
-### Balanced sampling
+</details>
+
+<details>
+<summary><b>Balanced sampling</b></summary>
 
 | Parameter | Default |
-|-----------|---------|
+|:----------|:-------:|
 | `use_balanced_sampling` | true |
 | `morphology_weight_power` | 0.5 |
 | `chromosome_count_weight_power` | 0.35 |
-| `sample_with_replacement` | true |
 
-Per-sample weight = `1 / count(morphology)^0.5 × 1 / count(count_bucket)^0.35`, so rare morphology/count combinations are oversampled.
-
-### Prompt variants
-
-`enable_prompt_variants=True` rotates among four user instructions (deterministic hash per sample id) so the model does not memorize a single prompt string.
-
----
-
-## How a training step works
-
-```mermaid
-flowchart LR
-  A[JSONL + raw image] --> B[CLAHE + 448 letterbox cache]
-  B --> C[Chat messages: system + user prompt + image]
-  C --> D[Assistant target: 7-field report]
-  D --> E[UnslothVisionDataCollator]
-  E --> F[MedGemma + LoRA forward]
-  F --> G[Completion-only CE loss]
-  G --> H[Backward + paged_adamw_8bit]
+```text
+weight = 1 / count(morphology)^0.5 × 1 / count(count_bucket)^0.35
 ```
 
-1. **Collator** tokenizes multimodal chat (image + text) up to `max_length`.  
-2. **Loss** is computed only on assistant completion tokens.  
-3. **Gemma3 fix:** `model_accepts_loss_kwargs=False` to avoid `num_items_in_batch` errors.  
-4. Every `eval_steps`: validation **cross-entropy** on a 192-sample subset.  
-5. Every `generation_eval_steps`: optional decode + BLEU / ROUGE-L / medical consistency (slow).  
-6. End of run: saves `final/` adapter unless you resume from a checkpoint.
+Four **prompt variants** per sample (hash of id) prevent memorizing one instruction string.
 
----
+</details>
 
-## Running training
+Full defaults: `chromastone_vlm/optimized_config.py` → `OptimizedMedGemmaConfig`
 
-### Recommended command (L4, production)
+<br>
 
-Skips slow mid-training and final generation evals (loss-only validation is enough for checkpoint selection):
+## Training
+
+### Recommended command (NVIDIA L4)
+
+Skips slow generation eval — **loss-only validation** is enough to pick checkpoints:
 
 ```bash
 python scripts/train_medgemma_optimized.py \
@@ -288,9 +380,7 @@ python scripts/train_medgemma_optimized.py \
   --skip-final-generation-eval
 ```
 
-Shorter `eval_steps` / `save_steps` (50) give finer-grained checkpoints; defaults in code are 200.
-
-### Resume from checkpoint
+### Resume
 
 ```bash
 python scripts/train_medgemma_optimized.py \
@@ -298,195 +388,196 @@ python scripts/train_medgemma_optimized.py \
   --skip-final-generation-eval
 ```
 
-### Wrapper entrypoint
-
-```bash
-python train_medgemma_optimized.py   # same as scripts/train_medgemma_optimized.py
-```
-
----
-
-## Checkpointing and early stopping
-
-Checkpoints are written under:
-
-```text
-dataset/checkpoints/medgemma_optimized/
-├── checkpoint-250/
-├── checkpoint-1300/
-├── checkpoint-1350/
-├── final/
-├── optimized_config.json      # frozen config for this run
-├── dataset_stats.json         # split statistics
-├── optimized_training.log     # text log
-└── training_summary.json      # runtime + best metric
-```
-
-Each `checkpoint-*` folder contains:
-
-- `adapter_model.safetensors` — LoRA weights to load with PEFT  
-- `adapter_config.json`  
-- Processor / tokenizer files  
-- `trainer_state.json` — step, eval history, best metric  
-
-**Early stopping** watches `eval_loss` with patience 4. **Best checkpoint** is reloaded at end (`load_best_model_at_end=True`).
-
----
-
-## Evaluation during and after training
-
-### Fast eval (every `eval_steps`)
-
-- Metric: **`eval_loss`** on up to 192 validation samples  
-- Used to pick the best checkpoint  
-
-### Generation eval (every `generation_eval_steps`)
-
-- Decodes up to 96 val samples  
-- Writes `dataset/reports/medgemma_optimized/generation_eval/val_step_*.json`  
-- Metrics per sample: BLEU, ROUGE-L, token F1, exact match, **medical consistency**, hallucination rate  
-
-### Manual eval after training
-
-```bash
-python scripts/evaluate_medgemma_optimized.py \
-  --checkpoint-dir dataset/checkpoints/medgemma_optimized/checkpoint-250 \
-  --split test \
-  --sample-limit 10
-```
-
-The evaluation script uses the same structured-report completion logic as inference (minimum 160 new tokens, retry if `Impression` / `Uncertainty` missing).
-
----
+<br>
 
 ## Recommended checkpoint
 
-Use **`checkpoint-250`**, not the last step (`checkpoint-1350`), for deployment:
+> **Deploy `checkpoint-250`**, not the final step `checkpoint-1350`.
 
-| Checkpoint | Step | Val `eval_loss` (approx.) | Why |
-|------------|------|---------------------------|-----|
-| **checkpoint-250** | 250 | **0.430** (best in run) | Lowest validation loss; better generation metrics in manual tests |
-| checkpoint-1350 | 1350 | higher | Trained longer; tends to overfit / worse BLEU on held-out samples |
+| Checkpoint | Step | Val loss | Verdict |
+|:-----------|:----:|:--------:|:--------|
+| **`checkpoint-250`** | 250 | **0.430** | Best metric — use this |
+| `checkpoint-1350` | 1350 | higher | Overfits — worse BLEU on held-out |
 
-Best metric recorded in `training_summary.json`: `best_metric: 0.4303189814090729` at step 250.
+Published adapter: **[Mukilan06/MedGemma-Chromosome-VLM](https://huggingface.co/Mukilan06/MedGemma-Chromosome-VLM)**
 
-Upload this adapter to Hugging Face: [Mukilan06/MedGemma-Chromosome-VLM](https://huggingface.co/Mukilan06/MedGemma-Chromosome-VLM).
+<br>
 
----
+## Checkpoint layout
 
-## Inference and Hugging Face reuse
-
-### Local checkpoint
-
-```bash
-python scripts/infer_medgemma_optimized.py \
-  --checkpoint-dir dataset/checkpoints/medgemma_optimized/checkpoint-250 \
-  --image dataset/cache/medgemma_l4/test/images_448/1054443.png
+```text
+dataset/checkpoints/medgemma_optimized/
+├── checkpoint-250/          ← recommended
+├── checkpoint-1350/
+├── final/
+├── optimized_config.json
+├── dataset_stats.json
+├── optimized_training.log
+└── training_summary.json
 ```
 
-### Hugging Face adapter (same base model required)
+Each checkpoint folder:
 
-```bash
-python scripts/infer_medgemma_hf_adapter.py \
-  --adapter-repo Mukilan06/MedGemma-Chromosome-VLM \
-  --image dataset/cache/medgemma_l4/test/images_448/1054443.png
-```
+| File | Role |
+|:-----|:-----|
+| `adapter_model.safetensors` | LoRA weights (PEFT) |
+| `adapter_config.json` | Adapter metadata |
+| processor / tokenizer | Multimodal I/O |
+| `trainer_state.json` | Steps, eval history, best metric |
 
-Inference details:
+<br>
 
-- Uses the same **system prompt** as training  
-- Enforces all **7 labels**; retries with a completion hint if truncated  
-- `max_new_tokens` effectively **≥160** (not the training-default 96)
+## Evaluation
 
----
+| Mode | When | Metric |
+|:-----|:-----|:-------|
+| **Fast** | every `eval_steps` | `eval_loss` (192 val samples) |
+| **Generation** | every `generation_eval_steps` | BLEU, ROUGE-L, token F1, medical consistency |
+| **Manual** | after training | `scripts/evaluate_medgemma_optimized.py` |
 
-## CLI reference
+Inference and eval use **≥160** `max_new_tokens` with automatic retry if `Impression` or `Uncertainty` is missing.
 
-`scripts/train_medgemma_optimized.py` flags map to `OptimizedMedGemmaConfig`:
+<br>
 
-| Flag | Config field |
-|------|----------------|
-| `--data-root` | `data_root` (+ derived paths) |
+## Inference
+
+| Source | Command |
+|:-------|:--------|
+| Local checkpoint | `scripts/infer_medgemma_optimized.py --checkpoint-dir …` |
+| Hugging Face | `scripts/infer_medgemma_hf_adapter.py --adapter-repo Mukilan06/MedGemma-Chromosome-VLM` |
+
+The HF repo is an **adapter only** — load with the same 4-bit Unsloth base model.
+
+<br>
+
+## CLI flags
+
+<details>
+<summary><code>scripts/train_medgemma_optimized.py</code> — click to expand</summary>
+
+| Flag | Maps to |
+|:-----|:--------|
+| `--data-root` | `data_root` |
 | `--output-root` | `output_root` |
-| `--reports-root` | `reports_root` |
 | `--model-name` | `model_name` |
-| `--fallback-model-name` | `fallback_model_name` |
-| `--image-size` | `image_size`, `eval_image_size` |
-| `--max-length` | `max_length` |
 | `--epochs` | `num_train_epochs` |
 | `--learning-rate` | `learning_rate` |
 | `--train-batch-size` | `per_device_train_batch_size` |
-| `--eval-batch-size` | `per_device_eval_batch_size` |
 | `--gradient-accumulation-steps` | `gradient_accumulation_steps` |
-| `--num-workers` | `dataloader_num_workers` |
+| `--image-size` | `image_size` |
+| `--max-length` | `max_length` |
 | `--eval-steps` | `eval_steps` |
 | `--save-steps` | `save_steps` |
 | `--generation-eval-steps` | `generation_eval_steps` |
-| `--resume-from-checkpoint` | `resume_from_checkpoint` |
-| `--skip-final-generation-eval` | `skip_final_generation_eval` |
-| `--force-refresh-cache` | rebuild image cache |
-| `--disable-unsloth` | `use_unsloth=False` (Transformers + PEFT fallback) |
+| `--resume-from-checkpoint` | resume path |
+| `--skip-final-generation-eval` | skip slow final decode |
+| `--force-refresh-cache` | rebuild PNG cache |
+| `--disable-unsloth` | Transformers + PEFT fallback |
 
----
+</details>
 
-## Outputs and logs
+<br>
+
+## Project structure
+
+```text
+.
+├── chromastone_vlm/          # core library
+│   ├── optimized_config.py
+│   ├── optimized_data.py
+│   ├── optimized_pipeline.py
+│   └── optimized_metrics.py
+├── scripts/                  # canonical CLIs
+│   ├── train_medgemma_optimized.py
+│   ├── evaluate_medgemma_optimized.py
+│   ├── infer_medgemma_optimized.py
+│   └── infer_medgemma_hf_adapter.py
+├── train_medgemma_optimized.py   # thin wrappers
+├── requirements.txt
+└── docs/legacy/                # archived notes
+```
+
+<br>
+
+## Outputs & logs
 
 | Path | Contents |
-|------|----------|
-| `dataset/checkpoints/medgemma_optimized/optimized_training.log` | Timestamped training log |
-| `dataset/checkpoints/medgemma_optimized/optimized_config.json` | Full hyperparameter snapshot |
-| `dataset/checkpoints/medgemma_optimized/dataset_stats.json` | Per-split morphology / count histograms |
-| `dataset/checkpoints/medgemma_optimized/training_summary.json` | Runtime, steps, best metric |
-| `dataset/reports/medgemma_optimized/generation_eval/` | Periodic generation eval JSON |
+|:-----|:---------|
+| `…/optimized_training.log` | Timestamped run log |
+| `…/optimized_config.json` | Frozen hyperparameters |
+| `…/dataset_stats.json` | Split histograms |
+| `…/training_summary.json` | Runtime, best metric |
+| `…/generation_eval/` | Periodic decode JSON |
 
-Large artifacts (`dataset/cache/`, checkpoints, reports) are **gitignored** — do not commit them to GitHub.
+`dataset/cache/`, checkpoints, and reports are **gitignored**.
 
----
+<br>
 
 ## Troubleshooting
 
-| Symptom | Fix |
-|---------|-----|
-| Training appears stuck after an epoch | Likely **generation eval** decoding; set `--generation-eval-steps 1000000` and `--skip-final-generation-eval` |
-| `num_items_in_batch` warning / error | Already handled in `ChromosomeSFTTrainer`; update `trl`/`unsloth` if it reappears |
-| OOM on GPU | Keep batch size 1, increase `gradient_accumulation_steps`, or disable extra workers |
-| FlashAttention import error | Pipeline falls back to default attention automatically |
-| Truncated reports at inference | Use `scripts/infer_*` (160+ token budget + retry), not raw `generate(max_new_tokens=96)` |
-| HF adapter load fails | Use the same 4-bit Unsloth base model; adapter alone is not a full model |
-| Missing images | Check `dataset/processed_data/{split}/images/` paths in JSONL |
+<details>
+<summary><b>Training appears stuck</b></summary>
 
----
-
-## Project layout
-
-| Path | Purpose |
-|------|---------|
-| `chromastone_vlm/` | Core library (`optimized_config`, `optimized_data`, `optimized_pipeline`, metrics) |
-| `scripts/` | Canonical CLI: train, evaluate, infer, HF infer |
-| `train_medgemma_optimized.py` | Thin wrapper → `scripts/train_medgemma_optimized.py` |
-| `evaluate_medgemma_optimized.py` | Thin wrapper → evaluate script |
-| `infer_medgemma_optimized.py` | Thin wrapper → local infer |
-| `infer_medgemma_hf_adapter.py` | Thin wrapper → HF infer |
-| `docs/legacy/` | Historical debugging notes (not required for training) |
-| `requirements.txt` | Python dependencies |
-
----
-
-## Quick command summary
+Likely mid-run **generation eval** (slow decoding). Use:
 
 ```bash
-# Train
-python scripts/train_medgemma_optimized.py --epochs 6 --eval-steps 50 --save-steps 50 \
-  --generation-eval-steps 1000000 --skip-final-generation-eval
-
-# Evaluate best checkpoint
-python scripts/evaluate_medgemma_optimized.py \
-  --checkpoint-dir dataset/checkpoints/medgemma_optimized/checkpoint-250 --split test
-
-# Infer locally
-python scripts/infer_medgemma_optimized.py \
-  --checkpoint-dir dataset/checkpoints/medgemma_optimized/checkpoint-250 \
-  --image path/to/image.png
+--generation-eval-steps 1000000 --skip-final-generation-eval
 ```
 
-For archived debugging reports and older training notes, see `docs/legacy/`.
+</details>
+
+<details>
+<summary><b>Out of memory</b></summary>
+
+Keep `train-batch-size 1`, raise `gradient-accumulation-steps`, or lower `num-workers`.
+
+</details>
+
+<details>
+<summary><b>Truncated reports at inference</b></summary>
+
+Use `scripts/infer_*` — not raw `generate(max_new_tokens=96)`. The pipeline retries at ≥160 tokens.
+
+</details>
+
+<details>
+<summary><b>HF adapter won't load</b></summary>
+
+Adapter requires the same base: `unsloth/medgemma-4b-it-unsloth-bnb-4bit`. It is not a standalone full model.
+
+</details>
+
+<details>
+<summary><b>Other issues</b></summary>
+
+| Symptom | Fix |
+|:--------|:----|
+| `num_items_in_batch` error | Handled in `ChromosomeSFTTrainer`; update `trl` / `unsloth` |
+| FlashAttention missing | Auto-fallback to default attention |
+| Missing images | Verify paths in `dataset/processed_data/{split}/images/` |
+
+</details>
+
+<br>
+
+## Hardware
+
+| Resource | Minimum |
+|:---------|:--------|
+| GPU | NVIDIA L4 / A10 — **≥22 GB VRAM** |
+| Precision | BF16 on 4-bit weights |
+| Disk | Cache PNGs + ~300 MB per checkpoint |
+
+Dependencies: PyTorch · Transformers · TRL · PEFT · bitsandbytes · accelerate · **unsloth** · OpenCV · Pillow
+
+<br>
+
+---
+
+<div align="center">
+
+**[↑ Back to top](#medgemma-chromosome-vlm)**
+
+Historical debugging notes → [`docs/legacy/`](docs/legacy/)
+
+</div>
